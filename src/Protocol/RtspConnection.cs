@@ -35,6 +35,8 @@ sealed class RtspConnection : IDisposable
         var connect = _tcp.ConnectAsync(ip, port);
         if (!connect.Wait(4000)) { _tcp.Dispose(); throw new TimeoutException("连接设备超时"); }
         if (connect.IsFaulted) throw connect.Exception!.InnerException!;
+        _tcp.Client.ReceiveTimeout = 6000;
+        _tcp.Client.SendTimeout = 6000;
         _stream = _tcp.GetStream();
         LocalIp = ((IPEndPoint)_tcp.Client.LocalEndPoint!).Address;
         RemoteIp = ip;
@@ -91,18 +93,23 @@ sealed class RtspConnection : IDisposable
             if (body is { Length: > 0 }) msg = [.. msg, .. body];
             var wire = _cipher != null ? _cipher.Encrypt(msg) : msg;
             _stream.Write(wire);
-            return ReadResponse();
+            return ReadResponse(method);
         }
     }
 
-    RtspResponse ReadResponse()
+    RtspResponse ReadResponse(string method)
     {
         while (true)
         {
             var resp = HttpParser.TryParse(_plain, isRequest: false);
             if (resp != null) return new RtspResponse(resp.Value.Code, resp.Value.Headers, resp.Value.Body);
 
-            int n = _stream.Read(_readBuf);
+            int n;
+            try { n = _stream.Read(_readBuf); }
+            catch (IOException ex) when (ex.InnerException is SocketException se && se.SocketErrorCode == SocketError.TimedOut)
+            {
+                throw new TimeoutException($"{method} 没有得到设备回应");
+            }
             if (n <= 0) throw new IOException("设备断开了连接");
             _plain.AddRange(_cipher != null ? _cipher.Decrypt(_readBuf.AsSpan(0, n)) : _readBuf.AsSpan(0, n).ToArray());
         }

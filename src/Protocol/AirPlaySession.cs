@@ -32,9 +32,9 @@ sealed partial class AirPlaySession : IDisposable
     readonly byte[][] _backlog = new byte[BacklogSize][];
     readonly ushort[] _backlogSeq = new ushort[BacklogSize];
 
-    volatile bool _running;
+    volatile bool _running, _streaming;
     readonly List<Thread> _threads = [];
-    int _failed, _timingRequests;
+    int _failed, _timingRequests, _controlPackets;
 
     /// <summary>会话意外中断时触发（参数为原因），只会触发一次。</summary>
     public event Action<string>? Failed;
@@ -60,42 +60,44 @@ sealed partial class AirPlaySession : IDisposable
         StartThread(TimingLoop, "timing");
         StartThread(ControlLoop, "control");
 
-        // 第一次 SETUP：建立会话与事件通道
+        // 第一次 SETUP：建立会话与事件通道。
+        // 较新的 HomePod 会先答应这次请求，等音频 SETUP 时才真正回连时钟。
         RtspResponse setup;
         try { setup = SetupSession(); }
-        catch (IOException) when (_timingRequests == 0)
-        {
-            // 设备迟迟不回应，而且一次对时请求都没收到：几乎可以确定是被防火墙拦了
-            throw new FirewallBlockedException();
-        }
+        catch (Exception ex) when (IsFirewallBlock(ex)) { throw new FirewallBlockedException(); }
         Expect(setup, "SETUP");
         var eventPort = Convert.ToInt32((setup.Plist as Dictionary<string, object>)?.GetValueOrDefault("eventPort") ?? 0L);
         StartEventChannel(sharedSecret, eventPort);
 
         // 第二次 SETUP：实时 PCM 音频流
         var shk = RandomNumberGenerator.GetBytes(32);
-        var streamSetup = _rtsp.Rtsp("SETUP", body: new Dictionary<string, object>
+        RtspResponse streamSetup;
+        try
         {
-            ["streams"] = new List<object>
+            streamSetup = _rtsp.Rtsp("SETUP", body: new Dictionary<string, object>
             {
-                new Dictionary<string, object>
+                ["streams"] = new List<object>
                 {
-                    ["audioFormat"] = 0x800,          // PCM 44100Hz 16bit 立体声
-                    ["audioMode"] = "default",
-                    ["controlPort"] = ((IPEndPoint)_control.LocalEndPoint!).Port,
-                    ["ct"] = 1,                       // 原始 PCM，不压缩
-                    ["isMedia"] = true,
-                    ["latencyMax"] = 88200,
-                    ["latencyMin"] = Math.Min(_latencyFrames, 11025),
-                    ["shk"] = shk,
-                    ["spf"] = FramesPerPacket,
-                    ["sr"] = SampleRate,
-                    ["type"] = 0x60,                  // 实时音频
-                    ["supportsDynamicStreamID"] = false,
-                    ["streamConnectionID"] = (long)_rtsp.SessionId,
+                    new Dictionary<string, object>
+                    {
+                        ["audioFormat"] = 0x800,          // PCM 44100Hz 16bit 立体声
+                        ["audioMode"] = "default",
+                        ["controlPort"] = ((IPEndPoint)_control.LocalEndPoint!).Port,
+                        ["ct"] = 1,                       // 原始 PCM，不压缩
+                        ["isMedia"] = true,
+                        ["latencyMax"] = 88200,
+                        ["latencyMin"] = Math.Min(_latencyFrames, 11025),
+                        ["shk"] = shk,
+                        ["spf"] = FramesPerPacket,
+                        ["sr"] = SampleRate,
+                        ["type"] = 0x60,                  // 实时音频
+                        ["supportsDynamicStreamID"] = false,
+                        ["streamConnectionID"] = (long)_rtsp.SessionId,
+                    },
                 },
-            },
-        });
+            });
+        }
+        catch (Exception ex) when (IsFirewallBlock(ex)) { throw new FirewallBlockedException(); }
         Expect(streamSetup, "SETUP stream");
         var stream = ((streamSetup.Plist as Dictionary<string, object>)?["streams"] as List<object>)?[0] as Dictionary<string, object>
             ?? throw new IOException("设备没有返回音频端口");
@@ -115,6 +117,7 @@ sealed partial class AirPlaySession : IDisposable
 
         SetVolume(volumePercent);
 
+        _streaming = true;
         var audio = new Thread(() => AudioLoop(seq)) { IsBackground = true, Name = "audio", Priority = ThreadPriority.Highest };
         _threads.Add(audio);
         audio.Start();
@@ -266,6 +269,7 @@ sealed partial class AirPlaySession : IDisposable
         {
             int n;
             try { n = _control!.ReceiveFrom(buf, ref from); } catch { if (!_running) return; continue; }
+            Interlocked.Increment(ref _controlPackets);
             // 0x55：设备请求重传丢失的包
             if (n < 8 || (buf[1] & 0x7F) != 0x55) continue;
             ushort lost = BinaryPrimitives.ReadUInt16BigEndian(buf.AsSpan(4));
@@ -424,6 +428,18 @@ sealed partial class AirPlaySession : IDisposable
         t.Start();
     }
 
+    /// <summary>
+    /// 会话能建起来，但 HomePod 的时钟回连一个包都没到，请求又超时了。
+    /// 这台电脑的入站 UDP 被防火墙丢掉时就是这个样子。
+    /// </summary>
+    bool IsFirewallBlock(Exception ex) =>
+        _timingRequests == 0 && _controlPackets == 0 && ex switch
+        {
+            TimeoutException => true,
+            IOException { InnerException: SocketException s } => s.SocketErrorCode == SocketError.TimedOut,
+            _ => false,
+        };
+
     static void Expect(RtspResponse r, string what)
     {
         if (r.Code != 200) throw new IOException($"{what} 失败（{r.Code}）");
@@ -439,7 +455,8 @@ sealed partial class AirPlaySession : IDisposable
     {
         bool wasRunning = _running;
         _running = false;
-        if (wasRunning && _rtsp != null)
+        // 还没开始推流就失败时，对端往往还卡在上一个请求里，拆线会再空等一轮超时
+        if (wasRunning && _streaming && _rtsp != null)
         {
             try { _rtsp.Rtsp("TEARDOWN", headers: [("Session", "0")]); } catch { }
         }

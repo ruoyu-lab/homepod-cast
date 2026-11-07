@@ -224,7 +224,7 @@ sealed class AppController
 
     static string Friendly(Exception ex) => ex switch
     {
-        TimeoutException => "设备没有响应",
+        TimeoutException t => t.Message.Contains("没有得到") ? t.Message : "设备没有响应",
         System.Net.Sockets.SocketException => "网络连接失败",
         IOException io when io.InnerException is System.Net.Sockets.SocketException => "设备没有响应",
         _ => ex.Message,
